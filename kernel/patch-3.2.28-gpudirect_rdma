@@ -1,0 +1,460 @@
+diff -Nur linux-3.2.28_vanilla/drivers/infiniband/core/umem.c linux-3.2.28_modified/drivers/infiniband/core/umem.c
+--- linux-3.2.28_vanilla/drivers/infiniband/core/umem.c	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/drivers/infiniband/core/umem.c	2013-03-27 20:28:10.596525445 +0200
+@@ -2,6 +2,7 @@
+  * Copyright (c) 2005 Topspin Communications.  All rights reserved.
+  * Copyright (c) 2005 Cisco Systems.  All rights reserved.
+  * Copyright (c) 2005 Mellanox Technologies. All rights reserved.
++ * Copyright (c) 2013 Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>. All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -40,13 +41,39 @@
+ #include <linux/dma-attrs.h>
+ #include <linux/slab.h>
+ 
++#include "../../nvidia/nv-p2p.h"
+ #include "uverbs.h"
+ 
++extern struct gpu_mem *g_mem;
++
+ #define IB_UMEM_MAX_PAGE_CHUNK						\
+ 	((PAGE_SIZE - offsetof(struct ib_umem_chunk, page_list)) /	\
+ 	 ((void *) &((struct ib_umem_chunk *) 0)->page_list[1] -	\
+ 	  (void *) &((struct ib_umem_chunk *) 0)->page_list[0]))
+ 
++static void __ib_gmem_release(struct ib_device *dev, struct ib_umem *umem)
++{
++	struct ib_umem_chunk *chunk, *tmp;
++	struct ib_gmem *gmem;
++	struct gpu_mem *gpu_mem;
++	nvidia_p2p_page_table_t *page_table;
++
++	if (!(umem->gdata)) 	return;
++	gmem = (struct ib_gmem *)umem->gdata;
++	gpu_mem = gmem->gpu_memory;
++	page_table = gmem->gpage_table;
++
++	list_for_each_entry_safe(chunk, tmp, &umem->chunk_list, list) {
++		ib_dma_unmap_sg(dev, chunk->page_list,
++				chunk->nents, DMA_BIDIRECTIONAL);
++
++		kfree(chunk);
++	}
++	
++	nvidia_p2p_put_pages(gpu_mem->tokens.p2pToken, gpu_mem->tokens.vaSpaceToken, (uint64_t)gpu_mem->gpu_addr, page_table);
++	kfree(gmem);
++}
++
+ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int dirty)
+ {
+ 	struct ib_umem_chunk *chunk, *tmp;
+@@ -67,16 +94,166 @@
+ 	}
+ }
+ 
++void ib_gfree_callback(void *data){
++}
++
+ /**
+- * ib_umem_get - Pin and DMA map userspace memory.
++ * __ib_gmem_get - Pin and DMA map GPU memory.
++ */
++struct ib_umem *__ib_gmem_get(struct ib_ucontext *context, unsigned long addr,
++                            size_t size, int access, int dmasync)
++{
++        struct ib_umem *umem;
++        struct page **page_list;
++        struct ib_umem_chunk *chunk;
++	struct ib_gmem *gmem;
++	nvidia_p2p_page_table_t *page_table;
++	unsigned long g_physaddr;
++        unsigned long locked;
++        unsigned long lock_limit;
++        unsigned long npages;
++	void (*func_ptr)(void *);
++        int ret;
++        int off;
++	int ib_max_mult;
++        int i;
++	DEFINE_DMA_ATTRS(attrs);
++
++	if (dmasync)
++		dma_set_attr(DMA_ATTR_WRITE_BARRIER, &attrs);
++
++	if (!can_do_mlock())
++		return ERR_PTR(-EPERM);
++
++	umem = kmalloc(sizeof *umem, GFP_KERNEL);
++	if (!umem)
++		return ERR_PTR(-ENOMEM);
++
++	umem->context   = context;
++	umem->length    = size;
++	umem->offset    = addr & ~GPU_PAGE_MASK;
++	umem->page_size = GPU_PAGE_SIZE;
++	umem->gdata = NULL;
++	/*
++	 * We ask for writable memory if any access flags other than
++	 * "remote read" are set.  "Local write" and "remote write"
++	 * obviously require write access.  "Remote atomic" can do
++	 * things like fetch and add, which will modify memory, and
++	 * "MW bind" can change permissions by binding a window.
++	 */
++	umem->writable  = !!(access & ~IB_ACCESS_REMOTE_READ);
++
++	/* We assume the memory is from hugetlb until proved otherwise */
++	umem->hugetlb   = 1;
++
++	INIT_LIST_HEAD(&umem->chunk_list);
++
++	npages = GPU_PAGE_ALIGN(size + umem->offset) >> GPU_PAGE_SHIFT;
++
++	down_write(&current->mm->mmap_sem);
++
++	locked     = npages + current->mm->pinned_vm;
++	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++
++	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = 0;
++
++	func_ptr = ib_gfree_callback;
++
++	//make gpu virtual address page aligned
++	g_mem->gpu_addr = (uint64_t)g_mem->gpu_addr & GPU_PAGE_MASK;
++
++	ret = nvidia_p2p_get_pages(g_mem->tokens.p2pToken, 
++					g_mem->tokens.vaSpaceToken, 
++					(uint64_t)g_mem->gpu_addr, 
++					g_mem->size, 
++					&page_table, 
++					func_ptr, 
++					&page_table);
++
++	if (ret < 0)
++		goto out;
++
++	ret=npages;
++
++	gmem = (struct ib_gmem *)kmalloc(sizeof(struct ib_gmem), GFP_KERNEL);
++	umem->gdata = gmem;
++	gmem->gpage_table = page_table;
++	gmem->gpu_memory = g_mem;
++
++	off = 0;
++	ib_max_mult = 0;
++
++	while (ret) {
++		chunk = kmalloc(sizeof *chunk + sizeof (struct scatterlist) *
++				min_t(int, ret, IB_UMEM_MAX_PAGE_CHUNK),
++				GFP_KERNEL);
++
++		if (!chunk) {
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		//FIXME: if size==1 , nvidia_p2p_get_pages does fill with NULL *(page_table->pages)
++		//only 127 pages at a time, otherwise kmem_alloc from other apps crashes
++		chunk->nents = min_t(int, ret, IB_UMEM_MAX_PAGE_CHUNK);
++		sg_init_table(chunk->page_list, chunk->nents);
++		for (i = 0 + ib_max_mult*IB_UMEM_MAX_PAGE_CHUNK; i < chunk->nents + ib_max_mult*IB_UMEM_MAX_PAGE_CHUNK; ++i) {
++
++			g_physaddr = (*((page_table->pages)+i))->physical_address;
++			sg_set_page(&chunk->page_list[i - ib_max_mult*IB_UMEM_MAX_PAGE_CHUNK], pfn_to_page(PFN_DOWN(g_physaddr)), GPU_PAGE_SIZE, 0);
++		}
++
++		chunk->nmap = ib_dma_map_sg_attrs(context->device,
++						  &chunk->page_list[0],
++						  chunk->nents,
++						  DMA_BIDIRECTIONAL,
++						  &attrs);
++
++		if (chunk->nmap <= 0) {
++			for (i = 0; i < chunk->nents; ++i)
++				put_page(sg_page(&chunk->page_list[i]));
++			kfree(chunk);
++
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		ib_max_mult++;
++		ret -= chunk->nents;
++		list_add_tail(&chunk->list, &umem->chunk_list);
++	}
++
++		ret = 0;
++
++out:
++	if (ret < 0) {
++		__ib_gmem_release(context->device, umem);
++		kfree(umem);
++	} else
++		current->mm->pinned_vm = locked;
++
++	up_write(&current->mm->mmap_sem);
++
++	free_page((unsigned long) page_list);
++
++	return ret < 0 ? ERR_PTR(ret) : umem;
++}
++
++/**
++ * __ib_umem_get - Pin and DMA map userspace memory.
+  * @context: userspace context to pin memory for
+  * @addr: userspace virtual address to start at
+  * @size: length of region to pin
+  * @access: IB_ACCESS_xxx flags for memory being pinned
+  * @dmasync: flush in-flight DMA when the memory region is written
+  */
+-struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+-			    size_t size, int access, int dmasync)
++struct ib_umem *__ib_umem_get(struct ib_ucontext *context, unsigned long addr,
++                            size_t size, int access, int dmasync)
+ {
+ 	struct ib_umem *umem;
+ 	struct page **page_list;
+@@ -105,6 +282,8 @@
+ 	umem->length    = size;
+ 	umem->offset    = addr & ~PAGE_MASK;
+ 	umem->page_size = PAGE_SIZE;
++	umem->gdata = NULL;
++
+ 	/*
+ 	 * We ask for writable memory if any access flags other than
+ 	 * "remote read" are set.  "Local write" and "remote write"
+@@ -216,6 +395,21 @@
+ 
+ 	return ret < 0 ? ERR_PTR(ret) : umem;
+ }
++
++/**
++ * ib_umem_get - Pin and DMA map userspace memory.
++ * @context: userspace context to pin memory for
++ * @addr: userspace virtual address to start at
++ * @size: length of region to pin
++ * @access: IB_ACCESS_xxx flags for memory being pinned
++ * @dmasync: flush in-flight DMA when the memory region is written
++ */
++struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
++			    size_t size, int access, int dmasync)
++{
++	if (access & IB_ACCESS_GPU_MEMORY) return __ib_gmem_get(context, addr, size, access, dmasync);
++	else return __ib_umem_get(context, addr, size, access, dmasync);
++}
+ EXPORT_SYMBOL(ib_umem_get);
+ 
+ static void ib_umem_account(struct work_struct *work)
+@@ -230,7 +424,7 @@
+ }
+ 
+ /**
+- * ib_umem_release - release memory pinned with ib_umem_get
++ * ib_umem_release - release memory pinned with __ib_umem_get
+  * @umem: umem struct to release
+  */
+ void ib_umem_release(struct ib_umem *umem)
+@@ -238,8 +432,10 @@
+ 	struct ib_ucontext *context = umem->context;
+ 	struct mm_struct *mm;
+ 	unsigned long diff;
+-
+-	__ib_umem_release(umem->context->device, umem, 1);
++	struct ib_gmem *gmem;
++	
++	if (umem->gdata) 	__ib_gmem_release(umem->context->device, umem);
++	else 	__ib_umem_release(umem->context->device, umem, 1);
+ 
+ 	mm = get_task_mm(current);
+ 	if (!mm) {
+diff -Nur linux-3.2.28_vanilla/drivers/infiniband/core/uverbs.h linux-3.2.28_modified/drivers/infiniband/core/uverbs.h
+--- linux-3.2.28_vanilla/drivers/infiniband/core/uverbs.h	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/drivers/infiniband/core/uverbs.h	2013-03-27 19:32:54.068440418 +0200
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2005 Mellanox Technologies. All rights reserved.
+  * Copyright (c) 2005 Voltaire, Inc. All rights reserved.
+  * Copyright (c) 2005 PathScale, Inc. All rights reserved.
++ * Copyright (c) 2013 Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>. All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -47,6 +48,32 @@
+ #include <rdma/ib_umem.h>
+ #include <rdma/ib_user_verbs.h>
+ 
++#define GPU_PAGE_SHIFT 		16
++#ifdef __ASSEMBLY__
++#define GPU_PAGE_SIZE 		(1 << GPU_PAGE_SHIFT)
++#else
++#define GPU_PAGE_SIZE 		(1UL << GPU_PAGE_SHIFT)
++#endif
++#define GPU_PAGE_MASK 		(~(GPU_PAGE_SIZE-1))
++#define GPU_PAGE_ALIGN(addr)	ALIGN(addr, GPU_PAGE_SIZE)
++
++struct cuda_tokens {
++    uint64_t p2pToken;
++    uint32_t vaSpaceToken;
++};
++
++struct gpu_mem {
++        struct cuda_tokens tokens;
++        void *gpu_addr;
++        int size;
++        int ioctl_param;
++};
++
++struct ib_gmem {
++	struct nvidia_p2p_page_table_t *gpage_table;
++	struct gpu_mem *gpu_memory;
++};
++
+ /*
+  * Our lifetime rules for these structs are the following:
+  *
+diff -Nur linux-3.2.28_vanilla/drivers/infiniband/core/uverbs_main.c linux-3.2.28_modified/drivers/infiniband/core/uverbs_main.c
+--- linux-3.2.28_vanilla/drivers/infiniband/core/uverbs_main.c	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/drivers/infiniband/core/uverbs_main.c	2013-03-28 02:13:47.877056689 +0200
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2005 Mellanox Technologies. All rights reserved.
+  * Copyright (c) 2005 Voltaire, Inc. All rights reserved.
+  * Copyright (c) 2005 PathScale, Inc. All rights reserved.
++ * Copyright (c) 2013 Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>. All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -54,6 +55,8 @@
+ MODULE_DESCRIPTION("InfiniBand userspace verbs access");
+ MODULE_LICENSE("Dual BSD/GPL");
+ 
++extern struct gpu_mem *g_mem;
++
+ enum {
+ 	IB_UVERBS_MAJOR       = 231,
+ 	IB_UVERBS_BASE_MINOR  = 192,
+@@ -668,12 +671,30 @@
+ 	return 0;
+ }
+ 
++static int ib_uverbs_ioctl(struct inode *inode, struct file *filp, __user unsigned long user_addr) {
++
++	int ret, p2p_ret;
++	void (*func_ptr)(void *);
++	void *data;
++	
++	ret = copy_from_user(g_mem, (struct gpu_mem *)user_addr, sizeof(struct gpu_mem));
++
++	if (ret > 0){
++	 	printk(KERN_ALERT "copy_from_user couldn't copy %d bytes\n",ret);
++		return -EAGAIN;
++	}
++	
++        return 0;
++}
++
++
+ static const struct file_operations uverbs_fops = {
+ 	.owner	 = THIS_MODULE,
+ 	.write	 = ib_uverbs_write,
+ 	.open	 = ib_uverbs_open,
+ 	.release = ib_uverbs_close,
+ 	.llseek	 = no_llseek,
++        .unlocked_ioctl = ib_uverbs_ioctl,
+ };
+ 
+ static const struct file_operations uverbs_mmap_fops = {
+@@ -683,6 +704,7 @@
+ 	.open	 = ib_uverbs_open,
+ 	.release = ib_uverbs_close,
+ 	.llseek	 = no_llseek,
++        .unlocked_ioctl = ib_uverbs_ioctl,
+ };
+ 
+ static struct ib_client uverbs_client = {
+@@ -885,6 +907,13 @@
+ 		goto out_class;
+ 	}
+ 
++	g_mem = (struct gpu_mem *)kmalloc(sizeof(struct gpu_mem), GFP_KERNEL);
++
++        if (g_mem == NULL){
++                printk(KERN_ALERT "Cannot allocate memory for struct g_mem\n");
++                return -ENOMEM;
++        }
++
+ 	return 0;
+ 
+ out_class:
+@@ -911,6 +940,8 @@
+ 	idr_destroy(&ib_uverbs_cq_idr);
+ 	idr_destroy(&ib_uverbs_qp_idr);
+ 	idr_destroy(&ib_uverbs_srq_idr);
++
++	kfree(g_mem);
+ }
+ 
+ module_init(ib_uverbs_init);
+diff -Nur linux-3.2.28_vanilla/drivers/infiniband/core/verbs.c linux-3.2.28_modified/drivers/infiniband/core/verbs.c
+--- linux-3.2.28_vanilla/drivers/infiniband/core/verbs.c	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/drivers/infiniband/core/verbs.c	2013-03-28 02:12:17.701054037 +0200
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
+  * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
+  * Copyright (c) 2005, 2006 Cisco Systems.  All rights reserved.
++ * Copyright (c) 2013, Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>. All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -45,6 +46,9 @@
+ #include <rdma/ib_verbs.h>
+ #include <rdma/ib_cache.h>
+ 
++struct gpu_memory *g_mem;
++EXPORT_SYMBOL(g_mem);
++
+ int ib_rate_to_mult(enum ib_rate rate)
+ {
+ 	switch (rate) {
+diff -Nur linux-3.2.28_vanilla/include/rdma/ib_umem.h linux-3.2.28_modified/include/rdma/ib_umem.h
+--- linux-3.2.28_vanilla/include/rdma/ib_umem.h	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/include/rdma/ib_umem.h	2013-03-27 20:02:16.052485774 +0200
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2007 Cisco Systems.  All rights reserved.
++ * Copyright (c) 2013 Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>.  All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -50,6 +51,7 @@
+ 	struct work_struct	work;
+ 	struct mm_struct       *mm;
+ 	unsigned long		diff;
++	void 			*gdata; 	//gpu specific data 
+ };
+ 
+ struct ib_umem_chunk {
+diff -Nur linux-3.2.28_vanilla/include/rdma/ib_verbs.h linux-3.2.28_modified/include/rdma/ib_verbs.h
+--- linux-3.2.28_vanilla/include/rdma/ib_verbs.h	2012-08-19 20:15:38.000000000 +0300
++++ linux-3.2.28_modified/include/rdma/ib_verbs.h	2013-03-27 19:43:58.520457492 +0200
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
+  * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
+  * Copyright (c) 2005, 2006, 2007 Cisco Systems.  All rights reserved.
++ * Copyright (c) 2013 Stefanos Gerangelos <sgerag@cslab.ece.ntua.gr>.  All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+@@ -827,7 +828,8 @@
+ 	IB_ACCESS_REMOTE_WRITE	= (1<<1),
+ 	IB_ACCESS_REMOTE_READ	= (1<<2),
+ 	IB_ACCESS_REMOTE_ATOMIC	= (1<<3),
+-	IB_ACCESS_MW_BIND	= (1<<4)
++	IB_ACCESS_MW_BIND	= (1<<4),
++	IB_ACCESS_GPU_MEMORY	= (1<<5)
+ };
+ 
+ struct ib_phys_buf {

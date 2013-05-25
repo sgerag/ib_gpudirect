@@ -1,0 +1,48 @@
+This procedure specifies the steps needed in order to build the libibverbs library with support of GPUDirect RDMA. Please read ../kernel/README for the relevant linux kernel patch. The versions used in our use case are:
+	* OFED stack 1.5.4 (libibverbs 1.1.4)
+	* Linux kernel 3.2.28
+	* NVIDIA driver 304.33
+
+1. Download the libibverbs from http://www.openfabrics.org/downloads/libibverbs/libibverbs-1.1.4-1.24.gb89d4d7.tar.gz
+2. Untar the .gz file.
+3. Perform the following in order to apply the patch:
+	~# cd <libibverbs-1.1.4>/
+	~# patch -p1 < <location_of_patch-libibverbs_1.1.4-gpudirect_rdma>
+4. Build the library:
+	~# cd <libibverbs-1.1.4>/
+	~# ./configure
+	~# make
+	~# make install
+
+
+If you installed successfully the patched library (and the kernel) you are ready to use our framework. It follows such a typical cuda + ib pseudocode:
+	#include ...
+
+	typedef struct {
+		CUDA_POINTER_ATTRIBUTE_P2P_TOKENS tokens;
+		void *gpu_addr;
+		int size;
+		int ioctl_param;
+	}gpu_mem_info;
+
+	int fd = open("/dev/infiniband/uverbs0",O_RDWR);
+
+	int ret = ioctl(fd, 11, cuda_ptr); //11 is arbitrary and does not matter
+
+	close(fd);
+
+	/* You can now perform direct registration of GPU memory without the need to cudaMemcpy first to host and then send the relevant GPU buffers as you would do with regular main memory buffers */
+
+	...
+	conn->recv_mr = ibv_reg_mr( 
+                s_ctx->pd,
+                conn->gpu_region,
+                BUFFER_SIZE,
+                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_GPU_MEMORY));
+	/* Watch out the new IBV_ACCESS_GPU_MEMORY flag*/
+	...
+
+
+HINT: ulimit -l specifies the maximum allowed registered memory in KB. The default is usually 64, which implies that the maximum buffer (GPU or not) size is 64KB. If you want to use larger buffers, you have to increase this value.
+
+For any problems or anything else, please do not hesitate to contact me at sgerag<at>cslab.ece.ntua.gr

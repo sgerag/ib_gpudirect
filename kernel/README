@@ -1,0 +1,65 @@
+This procedure specifies the steps needed in order to setup the ib driver with support of GPUDirect RDMA. Please read ../lib/README for the relevant libibverbs patch. The versions used in our use case are:
+	* Linux kernel 3.2.28
+	* NVIDIA driver 304.33
+	* OFED stack 1.5.4 (libibverbs 1.1.4)
+
+1. Download linux kernel from ftp://ftp.kernel.org/pub/linux/kernel/v3.x/linux-3.2.28.tar.bz2
+2. Untar the .bz2 file.
+3. Download nvidia driver and copy the following:
+	~# cp -r <nvidia-driver>/kernel <linux-kernel>/drivers/nvidia
+4  Then perform the following 
+	~# cd <linux-kernel>/drivers/nvidia, make module
+5. Append the following line:
+	 obj-y += nvdia 
+   to <linux-kernel>/drivers/Makefile
+6. Apply patch:
+	~# cd <linux-kernel>
+	~# patch -p1 < <location_of_patch-3.2.28-gpudirect_rdma>
+7. Then build the kernel/initramfs etc:
+	~# make menuconfig   --> (typical config with IB support)
+	~# make 
+	~# make modules_install
+	~# make
+	~# cd /boot/ 
+	~# mkinitramfs -o initrd.img-3.2.28
+	<make the appropriate changes to boot loader (GRUB/LILO) in order to point to your new kernel> -- update-grub or something
+	~# reboot
+8. If everything went allright, then:
+	~# uname -r 	--> (in order to verify the running kernel version)
+	~# modprobe nvidia
+	~# modprobe ib_core
+	~# lsmod | grep nvidia --> (must return something like the following:)
+	nvidia              11235955  153 ib_core
+
+
+If you installed successfully the patched kernel (and the library) you are ready to use our framework. It follows such a typical cuda + ib pseudocode:
+	#include ...
+
+	typedef struct {
+		CUDA_POINTER_ATTRIBUTE_P2P_TOKENS tokens;
+		void *gpu_addr;
+		int size;
+		int ioctl_param;
+	}gpu_mem_info;
+
+	int fd = open("/dev/infiniband/uverbs0",O_RDWR);
+
+	int ret = ioctl(fd, 11, cuda_ptr); //11 is arbitrary and does not matter
+
+	close(fd);
+
+	/* You can now perform direct registration of GPU memory without the need to cudaMemcpy first to host and then send the relevant GPU buffers as you would do with regular main memory buffers */
+
+	...
+	conn->recv_mr = ibv_reg_mr( 
+                s_ctx->pd,
+                conn->gpu_region,
+                BUFFER_SIZE,
+                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_GPU_MEMORY));
+	/* Watch out the new IBV_ACCESS_GPU_MEMORY flag*/
+	...
+
+
+HINT: ulimit -l specifies the maximum allowed registered memory in KB. The default is usually 64, which implies that the maximum buffer (GPU or not) size is 64KB. If you want to use larger buffers, you have to increase this value.
+
+For any problems or anything else, please do not hesitate to contact me at sgerag<at>cslab.ece.ntua.gr
