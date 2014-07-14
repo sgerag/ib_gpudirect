@@ -63,20 +63,20 @@ diff -Nur linux-3.2.28_vanilla/drivers/infiniband/core/umem.c linux-3.2.28_modif
 +struct ib_umem *__ib_gmem_get(struct ib_ucontext *context, unsigned long addr,
 +                            size_t size, int access, int dmasync)
 +{
-+        struct ib_umem *umem;
-+        struct page **page_list;
-+        struct ib_umem_chunk *chunk;
++       struct ib_umem *umem;
++       struct page **page_list;
++       struct ib_umem_chunk *chunk;
 +	struct ib_gmem *gmem;
 +	nvidia_p2p_page_table_t *page_table;
 +	unsigned long g_physaddr;
-+        unsigned long locked;
-+        unsigned long lock_limit;
-+        unsigned long npages;
++       unsigned long locked;
++       unsigned long lock_limit;
++       unsigned long npages;
 +	void (*func_ptr)(void *);
-+        int ret;
-+        int off;
++       int ret;
++       int off;
 +	int ib_max_mult;
-+        int i;
++       int i;
 +	DEFINE_DMA_ATTRS(attrs);
 +
 +	if (dmasync)
